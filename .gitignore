@@ -3,3 +3,6 @@
 *.obj
 *.log
 .vscode/
+__pycache__/
+*.pyc*
+output/
