@@ -305,16 +305,21 @@ class BSplineApp:
         self.redraw()
 
     def clear(self) -> None:
-        if self.mode == "2d":
-            self.curves = [[]]
-            self.fit_points = []
-            self.pixel_strokes = []
-            self.fit_result = None
-            self.fit_results = []
-            self.pixel_info = None
-            self.pixel_source_label = ""
-            self.expanded_strokes.clear()
-        else:
+        self.curves = [[]]
+        self.fit_points = []
+        self.pixel_strokes = []
+        self.fit_result = None
+        self.fit_results = []
+        self.pixel_info = None
+        self.pixel_source_label = ""
+        self.expanded_strokes.clear()
+        self.selected_stroke = -1
+        self.selected_point = -1
+        self.pending_draw_start = None
+        self.pending_draw_screen = None
+        self.drawing = False
+
+        if self.mode == "3d":
             self.surface_grid = self._create_surface_grid()
             self.selected_grid = (-1, -1)
         self.update_viewbar()
