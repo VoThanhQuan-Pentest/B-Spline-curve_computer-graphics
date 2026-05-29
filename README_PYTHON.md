@@ -11,7 +11,7 @@ Ban nay su dung Python, OpenCV va NumPy. Chuong trinh giu bo cuc chinh cua ban c
 ## Chay chuong trinh
 
 ```powershell
-cd C:\VSCode\DHMT\REcord
+cd D:\VSCode\DHMT\REcord
 python main.py
 ```
 
@@ -33,15 +33,17 @@ Trong app:
 4. Neu muon duong mot net o giua chu thay vi vien chu, chon `Reconstruction = Centerline`.
 5. Chuong trinh tu chuan hoa nen giay, tach pixel, loc nhieu, crop vung chu, lam muot duong vien/skeleton va tai tao cac net B-spline bang least-square.
 6. Neu muon chinh lai bac/so diem dieu khien, chon `File -> Least-Square Reconstruction...`.
-7. `File -> Export bsplinecurve.dat...`
+7. `File -> Save bsplinecurve.dat (DISCO)...` hoac nhan `Ctrl+S`.
+8. Mo DUTModeling/DISCO, chon `File -> Open` va mo file `bsplinecurve.dat` vua xuat. Khong mo `diempixel.dat` trong DISCO vi file do chi la tap diem pixel dau vao.
 
-File `bsplinecurve.dat` duoc ghi theo thu tu:
+File `bsplinecurve.dat` duoc xuat theo block DISCO:
 
 ```text
-Unum
-Udegree
-Uknot0 Uknot1 ...
-x0 y0 z0 w0
-x1 y1 z1 w1
+=============
+[BSPLINECURVE]
+UNum, UDegree, UKnotType
+// Control Points
+x y z w 0
+// UKnot Vector
 ...
 ```

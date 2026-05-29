@@ -450,8 +450,11 @@ def _preprocess_for_threshold(gray, quality: str):
         return cv2.medianBlur(gray, 3)
 
     work = cv2.medianBlur(gray, 3)
+    if quality == "high":
+        work = cv2.bilateralFilter(work, 5, 35, 35)
     height, width = work.shape[:2]
-    sigma = max(18.0, min(width, height) / (22.0 if quality == "balanced" else 18.0))
+    sigma_divisor = 18.0 if quality == "high" else 22.0
+    sigma = max(18.0, min(width, height) / sigma_divisor)
     background = cv2.GaussianBlur(work, (0, 0), sigmaX=sigma, sigmaY=sigma)
     background = np.maximum(background, 1)
     normalised = cv2.divide(work, background, scale=255)
@@ -468,6 +471,18 @@ def _threshold_text_mask(gray, threshold: int | None, invert: bool | None, auto_
     if auto_threshold or threshold is None:
         threshold_used, mask = cv2.threshold(work, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
         threshold_used = int(threshold_used)
+        if quality != "fast":
+            height, width = work.shape[:2]
+            block_size = int(max(31, min(151, (min(width, height) // 18) | 1)))
+            adaptive = cv2.adaptiveThreshold(
+                work,
+                255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY_INV,
+                block_size,
+                9 if quality == "high" else 11,
+            )
+            mask = cv2.bitwise_or(mask, adaptive)
     else:
         threshold_used = max(0, min(255, int(threshold)))
         if invert:
@@ -483,6 +498,15 @@ def _threshold_text_mask(gray, threshold: int | None, invert: bool | None, auto_
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
     return threshold_used, mask, raw_count
+
+
+def _thin_mask(mask, max_iterations: int) -> List[int]:
+    if cv2 is not None and np is not None and hasattr(cv2, "ximgproc") and hasattr(cv2.ximgproc, "thinning"):
+        thinned = cv2.ximgproc.thinning(mask, thinningType=cv2.ximgproc.THINNING_ZHANGSUEN)
+        return _mask_indices(thinned)
+
+    height, width = mask.shape[:2]
+    return _thin_foreground(width, height, _mask_indices(mask), max_iterations=max_iterations)
 
 
 def _opencv_component_mask(mask, min_component_area: int, quality: str):
@@ -578,6 +602,106 @@ def _indices_to_ordered_strokes(
     return strokes
 
 
+def _skeleton_components_to_graph_strokes(
+    width: int,
+    height: int,
+    components: Sequence[Sequence[int]],
+    max_points: int,
+    smooth_radius: int,
+    simplify_epsilon: float,
+) -> List[List[Point2D]]:
+    raw_paths: list[list[int]] = []
+    neighbor_offsets = (
+        (-1, -1), (0, -1), (1, -1),
+        (-1, 0),           (1, 0),
+        (-1, 1),  (0, 1),  (1, 1),
+    )
+
+    def component_adjacency(component: Sequence[int]) -> dict[int, list[int]]:
+        nodes = set(component)
+        adjacency: dict[int, list[int]] = {}
+        for idx in nodes:
+            x = idx % width
+            y = idx // width
+            neighbors: list[int] = []
+            for dx, dy in neighbor_offsets:
+                nx = x + dx
+                ny = y + dy
+                if 0 <= nx < width and 0 <= ny < height:
+                    neighbor = ny * width + nx
+                    if neighbor in nodes:
+                        neighbors.append(neighbor)
+            adjacency[idx] = sorted(neighbors)
+        return adjacency
+
+    def direction_score(previous: int, current: int, candidate: int) -> float:
+        px, py = previous % width, previous // width
+        cx, cy = current % width, current // width
+        nx, ny = candidate % width, candidate // width
+        vx, vy = cx - px, cy - py
+        wx, wy = nx - cx, ny - cy
+        denom = math.hypot(vx, vy) * math.hypot(wx, wy)
+        if denom <= 1e-12:
+            return 0.0
+        return (vx * wx + vy * wy) / denom
+
+    def trace_walk(adjacency: dict[int, list[int]], start: int, visited_nodes: set[int]) -> list[int]:
+        path = [start]
+        previous: int | None = None
+        current = start
+        visited_nodes.add(start)
+
+        while True:
+            candidates = [node for node in adjacency[current] if node != previous and node not in visited_nodes]
+            if not candidates:
+                break
+            if previous is None:
+                next_node = min(candidates, key=lambda node: (len(adjacency[node]), node % width, node // width))
+            else:
+                next_node = max(candidates, key=lambda node: (direction_score(previous, current, node), -len(adjacency[node])))
+            path.append(next_node)
+            visited_nodes.add(next_node)
+            previous, current = current, next_node
+        return path
+
+    for component in components:
+        if len(component) < 2:
+            continue
+        adjacency = component_adjacency(component)
+        visited_nodes: set[int] = set()
+        endpoints = sorted(node for node, neighbors in adjacency.items() if len(neighbors) <= 1)
+        starts = endpoints or [min(adjacency, key=lambda node: (node % width, node // width))]
+
+        for start in starts:
+            if start not in visited_nodes:
+                raw_paths.append(trace_walk(adjacency, start, visited_nodes))
+
+        while len(visited_nodes) < len(adjacency):
+            remaining = [node for node in adjacency if node not in visited_nodes]
+            remaining_endpoints = [node for node in remaining if sum(1 for neighbor in adjacency[node] if neighbor not in visited_nodes) <= 1]
+            start = min(remaining_endpoints or remaining, key=lambda node: (node % width, node // width))
+            raw_paths.append(trace_walk(adjacency, start, visited_nodes))
+
+    raw_paths = [path for path in raw_paths if len(path) >= 2]
+    raw_paths.sort(key=lambda path: (min(idx % width for idx in path), min(idx // width for idx in path)))
+    total_length = max(1, sum(len(path) for path in raw_paths))
+
+    strokes: List[List[Point2D]] = []
+    for path in raw_paths:
+        budget = max(8, int(max_points * (len(path) / total_length)))
+        path_points = [Point2D(float(idx % width), float(height - 1 - idx // width)) for idx in path]
+        limited = _limit_ordered_points(path_points, max_points=budget)
+        if smooth_radius > 0 and len(limited) >= 5:
+            limited = moving_average(limited, radius=smooth_radius)
+        if simplify_epsilon > 0 and len(limited) >= 3:
+            limited = ramer_douglas_peucker(limited, simplify_epsilon)
+        if len(limited) < 6 and len(path_points) >= 6:
+            limited = _limit_ordered_points(path_points, max_points=min(max(6, budget), len(path_points)))
+        if len(limited) >= 2:
+            strokes.append(limited)
+    return strokes
+
+
 def _angle_order_points(points: Sequence[Point2D]) -> List[Point2D]:
     if len(points) < 3:
         return list(points)
@@ -629,12 +753,7 @@ def _extract_handwriting_pixels_opencv(
 
     strokes: List[List[Point2D]] = []
     if reconstruction_mode == "centerline":
-        skeleton = _thin_foreground(
-            width,
-            height,
-            _mask_indices(filtered_mask),
-            max_iterations=90 if quality == "high" else 70,
-        )
+        skeleton = _thin_mask(filtered_mask, max_iterations=90 if quality == "high" else 70)
         skeleton, skeleton_components, skeleton_removed = _filter_connected_components(
             width,
             height,
@@ -642,15 +761,13 @@ def _extract_handwriting_pixels_opencv(
             min_component_area=max(2, int(min_component_area) // 2),
         )
         removed_components += skeleton_removed
-        max_points_per_stroke = max(12, max_points // max(1, len(skeleton_components)))
-        strokes = _indices_to_ordered_strokes(
+        strokes = _skeleton_components_to_graph_strokes(
             width,
             height,
             skeleton_components,
-            max_points_per_stroke=max_points_per_stroke,
-            smooth_radius=2 if quality == "high" else 1,
-            simplify_epsilon=0.3 if quality == "high" else 0.55,
-            order_mode="nearest",
+            max_points=max_points,
+            smooth_radius=1 if quality == "high" else 1,
+            simplify_epsilon=0.05 if quality == "high" else 0.25,
         )
     else:
         contours, _hierarchy = cv2.findContours(filtered_mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
@@ -666,7 +783,7 @@ def _extract_handwriting_pixels_opencv(
 
         contour_items.sort(key=lambda item: (item[2], item[3]))
         total_contour_points = max(1, sum(len(item[0]) for item in contour_items))
-        smooth_radius = 3 if quality == "high" else (2 if quality == "balanced" else 1)
+        smooth_radius = 1 if quality == "high" else (2 if quality == "balanced" else 1)
         for contour, _area, _x, _y, _w, _h in contour_items:
             contour_points = contour[:, 0, :]
             points = [Point2D(float(x), float(height - 1 - y)) for x, y in contour_points]
@@ -811,15 +928,25 @@ def extract_handwriting_pixels(
     raw = _indices_to_points(width, height, curve_indices)
     stroke_budget = max(20, int(max_points))
     max_points_per_stroke = max(12, stroke_budget // max(1, len(curve_component_indices)))
-    strokes = _indices_to_ordered_strokes(
-        width,
-        height,
-        curve_component_indices,
-        max_points_per_stroke=max_points_per_stroke,
-        smooth_radius=0 if mode == "outline" else smooth_radius,
-        simplify_epsilon=0.0,
-        order_mode="angle" if mode == "outline" else "nearest",
-    )
+    if mode == "centerline":
+        strokes = _skeleton_components_to_graph_strokes(
+            width,
+            height,
+            curve_component_indices,
+            max_points=stroke_budget,
+            smooth_radius=smooth_radius,
+            simplify_epsilon=0.0,
+        )
+    else:
+        strokes = _indices_to_ordered_strokes(
+            width,
+            height,
+            curve_component_indices,
+            max_points_per_stroke=max_points_per_stroke,
+            smooth_radius=0,
+            simplify_epsilon=0.0,
+            order_mode="angle",
+        )
 
     ordered = _nearest_neighbor_order(raw, max_points=max_points)
     if smooth_radius > 0:

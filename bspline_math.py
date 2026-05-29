@@ -4,6 +4,11 @@ from dataclasses import dataclass
 from math import hypot
 from typing import Iterable, List, Sequence, Tuple
 
+try:
+    import numpy as _np
+except Exception:
+    _np = None
+
 
 @dataclass
 class Point2D:
@@ -187,6 +192,15 @@ def chord_length_parameters(points: Sequence[Point2D]) -> List[float]:
 
 
 def solve_linear_system(matrix: Sequence[Sequence[float]], rhs: Sequence[float]) -> List[float]:
+    if _np is not None:
+        a_np = _np.asarray(matrix, dtype=float)
+        b_np = _np.asarray(rhs, dtype=float)
+        try:
+            return [float(value) for value in _np.linalg.solve(a_np, b_np)]
+        except _np.linalg.LinAlgError:
+            solution, *_unused = _np.linalg.lstsq(a_np, b_np, rcond=None)
+            return [float(value) for value in solution]
+
     n = len(rhs)
     a = [list(row) + [float(rhs[i])] for i, row in enumerate(matrix)]
 

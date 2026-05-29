@@ -10,12 +10,13 @@ from bspline_math import (
     Point3D,
     BSplineFit,
     clamp_degree,
+    evaluate_curve,
     evaluate_surface,
     generate_clamped_knots,
     least_squares_approximation,
     sample_curve,
 )
-from disco_export import export_bsplinecurve_dat, export_readable_report
+from disco_export import export_bsplinecurve_dat, export_bsplinecurves_dat, export_readable_report
 from image_processing import PixelExtractionInfo, PixelExtractionResult, extract_handwriting_pixels, read_pixel_points, write_pixel_points
 
 
@@ -35,7 +36,7 @@ class ImageImportOptionsDialog:
         self.manual_threshold = tk.IntVar(value=140)
         self.max_points = tk.IntVar(value=9000)
         self.min_noise_area = tk.IntVar(value=8)
-        self.reconstruction_mode = tk.StringVar(value="outline")
+        self.reconstruction_mode = tk.StringVar(value="centerline")
         self.quality = tk.StringVar(value="high")
 
         frame = ttk.Frame(self.window, padding=12)
@@ -65,8 +66,8 @@ class ImageImportOptionsDialog:
         ttk.Label(frame, text="Reconstruction").grid(row=5, column=0, sticky="w", pady=3)
         mode_frame = ttk.Frame(frame)
         mode_frame.grid(row=5, column=1, sticky="ew", pady=3)
-        ttk.Radiobutton(mode_frame, text="Outline", value="outline", variable=self.reconstruction_mode).pack(side=tk.LEFT)
-        ttk.Radiobutton(mode_frame, text="Centerline", value="centerline", variable=self.reconstruction_mode).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Radiobutton(mode_frame, text="Centerline", value="centerline", variable=self.reconstruction_mode).pack(side=tk.LEFT)
+        ttk.Radiobutton(mode_frame, text="Outline", value="outline", variable=self.reconstruction_mode).pack(side=tk.LEFT, padx=(8, 0))
 
         actions = ttk.Frame(frame)
         actions.grid(row=6, column=0, columnspan=2, sticky="e", pady=(12, 0))
@@ -144,7 +145,8 @@ class BSplineApp:
         self.pending_draw_start: Point2D | None = None
         self.pending_draw_screen: tuple[float, float] | None = None
         self.last_mouse = (0.0, 0.0)
-        self.show_help = False
+        self.show_help = True
+        self.help_close_bounds: tuple[float, float, float, float] | None = None
         self.expanded_strokes: set[int] = set()
         self.viewbar_rows: list[tuple[str, int, int | None]] = []
 
@@ -213,14 +215,14 @@ class BSplineApp:
         menubar.add_cascade(label="Mode", menu=mode)
 
         file_menu = tk.Menu(menubar, tearoff=False)
-        file_menu.add_command(label="Load TXT Points...", command=self.load_points)
-        file_menu.add_command(label="Save TXT Points...", command=self.save_points)
+        file_menu.add_command(label="Save bsplinecurve.dat (DISCO)...", command=self.export_bsplinecurve)
+        file_menu.add_command(label="Save Raw Points (.txt)...", command=self.save_points)
+        file_menu.add_command(label="Load Raw Points (.txt/.dat)...", command=self.load_points)
         file_menu.add_command(label="Save Canvas Image...", command=self.save_canvas_image)
         file_menu.add_separator()
         file_menu.add_command(label="Open Image -> diempixel.dat...", command=self.extract_pixels_from_image)
         file_menu.add_command(label="Load diempixel.dat...", command=self.load_pixel_dat)
         file_menu.add_command(label="Least-Square Reconstruction...", command=self.reconstruct_from_pixels)
-        file_menu.add_command(label="Export bsplinecurve.dat...", command=self.export_bsplinecurve)
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.root.destroy)
         menubar.add_cascade(label="File", menu=file_menu)
@@ -278,6 +280,7 @@ class BSplineApp:
         self.canvas.bind("<ButtonPress-3>", self.on_right_down)
         self.canvas.bind("<MouseWheel>", self.on_mouse_wheel)
         self.root.bind("<Escape>", lambda _event: self.close_help_or_exit())
+        self.root.bind("<Control-s>", lambda _event: self.export_bsplinecurve())
 
     def _create_surface_grid(self) -> list[list[Point3D]]:
         grid: list[list[Point3D]] = []
@@ -402,7 +405,11 @@ class BSplineApp:
 
     def on_left_down(self, event: tk.Event) -> None:
         if self.show_help:
-            self.toggle_help()
+            if self.help_close_bounds is not None:
+                x1, y1, x2, y2 = self.help_close_bounds
+                if x1 <= event.x <= x2 and y1 <= event.y <= y2:
+                    self.show_help = False
+                    self.redraw()
             return
         self.last_mouse = (event.x, event.y)
         if self.mode == "3d":
@@ -762,12 +769,14 @@ class BSplineApp:
                         self.canvas.create_text(sx + 12, sy - 10, text=f"P{point_index}", fill="#111827", anchor="w", font=("Consolas", 9))
 
             curve_points = list(draw_stroke)
-            degree = clamp_degree(self.degree, len(curve_points))
-            if self.is_closed.get() and len(curve_points) > degree:
+            fit = self.fit_results[stroke_index] if stroke_index < len(self.fit_results) else None
+            knots = list(fit.knots) if fit is not None and len(fit.control_points) == len(stroke) else None
+            degree = fit.degree if fit is not None and knots is not None else clamp_degree(self.degree, len(curve_points))
+            if knots is None and self.is_closed.get() and len(curve_points) > degree:
                 curve_points.extend(curve_points[:degree])
             if len(curve_points) >= degree + 1:
                 sample_count = max(360, min(1600, len(curve_points) * (12 if self.is_closed.get() else 18)))
-                samples = sample_curve(curve_points, degree, samples=sample_count)
+                samples = sample_curve(curve_points, degree, knots=knots, samples=sample_count)
                 coords = []
                 for point in samples:
                     coords.extend(self.world_to_screen(point))
@@ -851,7 +860,7 @@ class BSplineApp:
         return Point3D(point.x - width * 0.5, 35.0, point.y - height * 0.5)
 
     def draw_2d_curves_in_3d(self) -> None:
-        for stroke in self.curves:
+        for stroke_index, stroke in enumerate(self.curves):
             if not stroke:
                 continue
 
@@ -860,12 +869,14 @@ class BSplineApp:
                 self.draw_polyline_3d(poly, "#9ca3af", width=1)
 
             curve_points = list(stroke)
-            degree = clamp_degree(self.degree, len(curve_points))
-            if self.is_closed.get() and len(curve_points) > degree:
+            fit = self.fit_results[stroke_index] if stroke_index < len(self.fit_results) else None
+            knots = list(fit.knots) if fit is not None and len(fit.control_points) == len(stroke) else None
+            degree = fit.degree if fit is not None and knots is not None else clamp_degree(self.degree, len(curve_points))
+            if knots is None and self.is_closed.get() and len(curve_points) > degree:
                 curve_points.extend(curve_points[:degree])
             if len(curve_points) >= degree + 1:
                 sample_count = max(220, min(900, len(curve_points) * 10))
-                sampled = sample_curve(curve_points, degree, samples=sample_count)
+                sampled = sample_curve(curve_points, degree, knots=knots, samples=sample_count)
                 self.draw_polyline_3d([self.curve_point_to_3d(point) for point in sampled], self.curve_color, width=max(1, int(self.line_width)))
 
             if self.show_points.get():
@@ -915,28 +926,49 @@ class BSplineApp:
         height = self.canvas.winfo_height()
         x1, y1 = 60, 60
         x2, y2 = width - 60, height - 60
-        self.canvas.create_rectangle(x1, y1, x2, y2, fill="#05080dcc", outline="#6aa6ff", width=3)
+        self.canvas.create_rectangle(x1, y1, x2, y2, fill="#05080d", outline="#6aa6ff", width=3)
+        close_size = 30
+        close_x1 = x2 - close_size - 16
+        close_y1 = y1 + 14
+        close_x2 = close_x1 + close_size
+        close_y2 = close_y1 + close_size
+        self.help_close_bounds = (close_x1, close_y1, close_x2, close_y2)
+        self.canvas.create_rectangle(close_x1, close_y1, close_x2, close_y2, fill="#1f2937", outline="#f2f6ff", width=1)
+        self.canvas.create_text((close_x1 + close_x2) / 2, (close_y1 + close_y2) / 2, text="X", fill="#ffffff", font=("Times New Roman", 12, "bold"))
         lines = [
-            "HUONG DAN SU DUNG B-SPLINE PYTHON",
+            "HƯỚNG DẪN SỬ DỤNG B-SPLINE PYTHON",
+            "Bấm nút X ở góc phải khung này hoặc phím ESC để đóng hướng dẫn.",
             "",
-            "2D: Chuot trai ve/keo diem, chuot phai xoa diem, chuot giua chen diem hoac pan.",
-            "2D: Lan chuot de zoom. Menu View bat/tat grid, point, polygon, symmetry, animation.",
-            "3D: Chuot trai xoay camera, chuot giua pan, chuot phai chon diem luoi.",
-            "3D: Lan chuot khi da chon diem de nang/ha truc Y; neu chua chon thi zoom camera.",
+            "QUY TRÌNH ĐỀ TÀI:",
+            "1. File -> Open Image -> diempixel.dat... để chọn ảnh chữ viết tay.",
+            "2. Nên bật Auto threshold, chọn Quality = high, Max points khoảng 9000.",
+            "3. Reconstruction = Centerline nếu muốn lấy đường nét viết ở giữa chữ.",
+            "4. Reconstruction = Outline nếu muốn lấy đường viền và giữ hình dạng đầy đủ.",
+            "5. Sau khi import, chương trình tự xuất output/diempixel.dat và tái tạo B-spline.",
+            "6. Nếu cần chỉnh Unum/Udegree: File -> Least-Square Reconstruction...",
+            "7. File -> Save bsplinecurve.dat (DISCO)... hoặc Ctrl+S để xuất file kiểm tra.",
             "",
-            "De tai chu viet tay:",
-            "File -> Open Image -> diempixel.dat de doc pixel anh chu viet tay.",
-            "Import anh: nen dung Auto threshold, Quality high, Outline cho anh chup nen giay.",
-            "File -> Least-Square Reconstruction de tai tao B-spline non-uniform.",
-            "File -> Export bsplinecurve.dat de xuat Unum, Udegree, Uknot, P4.",
+            "GỢI Ý CHỈNH ẢNH:",
+            "- Hình bị đứt nét: tăng Max points, giảm Min noise area, thử Centerline/Outline.",
+            "- Hình bị nhiễu: tăng Min noise area hoặc dùng ảnh nền trắng, chữ tối, rõ nét.",
+            "- Đường quá mượt, mất chi tiết: tăng Unum trong Least-Square Reconstruction.",
+            "- Đường rung hoặc quá rối: giảm Unum hoặc tăng Min noise area.",
+            "- Không mở diempixel.dat trong DISCO; chỉ mở bsplinecurve.dat.",
             "",
-            "ESC dong bang nay hoac thoat chuong trinh.",
+            "THAO TÁC NHANH:",
+            "2D: Chuột trái vẽ/kéo điểm, chuột phải xóa điểm, chuột giữa chèn điểm/pan.",
+            "2D: Lăn chuột để zoom. Edit -> Clear Canvas để xóa dữ liệu hiện tại.",
+            "3D: Chuột trái xoay camera, chuột giữa pan, chuột phải chọn điểm lưới.",
+            "3D: Lăn chuột khi đã chọn điểm để nâng/hạ trục Y; chưa chọn thì zoom camera.",
+            "View: bật/tắt Pts, Poly, Grid, Snap, Show Extracted Pixels.",
+            "",
+            "Có thể mở lại khung này bằng Help -> Instructions.",
         ]
-        y = y1 + 35
+        y = y1 + 42
         for idx, line in enumerate(lines):
-            font = ("Segoe UI", 13, "bold") if idx == 0 else ("Segoe UI", 11)
+            font = ("Times New Roman", 15, "bold") if idx == 0 else ("Times New Roman", 12)
             self.canvas.create_text(x1 + 28, y, text=line, fill="#f2f6ff", anchor="w", font=font)
-            y += 27
+            y += 24
 
     def redraw(self) -> None:
         self.canvas.delete("all")
@@ -955,7 +987,7 @@ class BSplineApp:
 
     def load_points(self) -> None:
         path = filedialog.askopenfilename(
-            title="Load TXT points",
+            title="Load raw points",
             initialdir=str(APP_DIR),
             filetypes=[("Text files", "*.txt *.dat"), ("All files", "*.*")],
         )
@@ -1009,7 +1041,7 @@ class BSplineApp:
 
     def save_points(self) -> None:
         path = filedialog.asksaveasfilename(
-            title="Save TXT points",
+            title="Save raw points (.txt)",
             initialdir=str(APP_DIR),
             initialfile="points.txt",
             defaultextension=".txt",
@@ -1022,7 +1054,10 @@ class BSplineApp:
             for stroke_id, stroke in enumerate(self.curves):
                 for point in stroke:
                     file.write(f"{stroke_id} {point.x:.6f} {point.y:.6f}\n")
-        messagebox.showinfo("Save TXT", f"Da luu: {path}")
+        messagebox.showinfo(
+            "Save Raw Points",
+            f"Da luu file diem tho:\n{path}\n\nFile nay khong dung de mo trong DISCO. Muon mo trong DISCO hay dung File -> Save bsplinecurve.dat (DISCO).",
+        )
 
     def save_canvas_image(self) -> None:
         path = filedialog.asksaveasfilename(
@@ -1191,7 +1226,7 @@ class BSplineApp:
     ) -> list[BSplineFit]:
         fits: list[BSplineFit] = []
         for stroke in strokes:
-            if len(stroke) < max(6, degree + 1):
+            if len(stroke) < 2:
                 continue
             local_degree = clamp_degree(degree, len(stroke))
             if control_count is None:
@@ -1199,23 +1234,72 @@ class BSplineApp:
                 quality = self.pixel_info.quality if self.pixel_info else "balanced"
                 if is_outline:
                     if quality == "high":
-                        divisor, max_controls, min_controls = 6, 160, 10
+                        divisor, max_controls, min_controls = 3, 260, 12
                     elif quality == "fast":
-                        divisor, max_controls, min_controls = 12, 80, 8
+                        divisor, max_controls, min_controls = 8, 100, 8
                     else:
-                        divisor, max_controls, min_controls = 8, 120, 9
+                        divisor, max_controls, min_controls = 5, 180, 10
                 else:
                     if quality == "high":
-                        divisor, max_controls, min_controls = 5, 72, 8
+                        divisor, max_controls, min_controls = 2, 180, 6
                     elif quality == "fast":
-                        divisor, max_controls, min_controls = 10, 28, 6
+                        divisor, max_controls, min_controls = 7, 60, 4
                     else:
-                        divisor, max_controls, min_controls = 7, 48, 7
+                        divisor, max_controls, min_controls = 4, 120, 5
                 local_controls = max(local_degree + 1, min(max_controls, max(min_controls, len(stroke) // divisor)))
             else:
                 local_controls = max(local_degree + 1, min(int(control_count), len(stroke)))
-            fits.append(least_squares_approximation(stroke, degree=local_degree, control_count=local_controls))
+            if control_count is None:
+                fits.append(self.fit_stroke_adaptive(stroke, local_degree, local_controls, max_controls))
+            else:
+                fits.append(least_squares_approximation(stroke, degree=local_degree, control_count=local_controls))
         return fits
+
+    def fit_stroke_adaptive(
+        self,
+        stroke: list[Point2D],
+        degree: int,
+        initial_controls: int,
+        max_controls: int,
+    ) -> BSplineFit:
+        is_outline = bool(self.pixel_info and self.pixel_info.reconstruction_mode == "outline")
+        quality = self.pixel_info.quality if self.pixel_info else "balanced"
+        target_error = 0.9 if quality == "high" else (1.5 if quality == "balanced" else 2.4)
+        if is_outline:
+            target_error += 0.4
+
+        control_count = max(degree + 1, min(initial_controls, max_controls, len(stroke)))
+        best_fit = least_squares_approximation(stroke, degree=degree, control_count=control_count)
+        best_error = self.fit_rms_error(stroke, best_fit)
+
+        for _attempt in range(6):
+            if best_error <= target_error or control_count >= min(max_controls, len(stroke)):
+                break
+            next_controls = min(min(max_controls, len(stroke)), max(control_count + 2, int(control_count * 1.5)))
+            if next_controls <= control_count:
+                break
+            candidate = least_squares_approximation(stroke, degree=degree, control_count=next_controls)
+            candidate_error = self.fit_rms_error(stroke, candidate)
+            if candidate_error <= best_error:
+                best_fit = candidate
+                best_error = candidate_error
+                control_count = next_controls
+            else:
+                break
+        return best_fit
+
+    @staticmethod
+    def fit_rms_error(stroke: list[Point2D], fit: BSplineFit) -> float:
+        if not stroke or not fit.parameters:
+            return 0.0
+        total = 0.0
+        count = min(len(stroke), len(fit.parameters))
+        for point, u in zip(stroke[:count], fit.parameters[:count]):
+            curve_point = evaluate_curve(fit.control_points, fit.degree, fit.knots, u)
+            dx = curve_point.x - point.x
+            dy = curve_point.y - point.y
+            total += dx * dx + dy * dy
+        return math.sqrt(total / max(1, count))
 
     def reconstruct_pixel_strokes_auto(self) -> None:
         source_strokes = self.pixel_strokes if self.pixel_strokes else ([self.fit_points] if self.fit_points else [])
@@ -1242,24 +1326,37 @@ class BSplineApp:
         self.show_fit_pixels.set(False)
 
     def export_bsplinecurve(self) -> None:
+        export_curves: list[list[Point2D]] = []
+        export_degrees: list[int] = []
+        export_knots: list[list[float]] = []
+
         if self.fit_results:
-            export_fits = self.fit_results
-            controls = export_fits[0].control_points
-            degree = export_fits[0].degree
-            knots = export_fits[0].knots
+            for fit in self.fit_results:
+                export_curves.append(list(fit.control_points))
+                export_degrees.append(fit.degree)
+                export_knots.append(list(fit.knots))
         elif self.fit_result:
-            export_fits = [self.fit_result]
-            controls = self.fit_result.control_points
-            degree = self.fit_result.degree
-            knots = self.fit_result.knots
+            export_curves.append(list(self.fit_result.control_points))
+            export_degrees.append(self.fit_result.degree)
+            export_knots.append(list(self.fit_result.knots))
         else:
-            export_fits = []
-            controls = next((stroke for stroke in self.curves if stroke), [])
-            if not controls:
-                messagebox.showwarning("Export", "Chua co duong cong de xuat.")
-                return
-            degree = clamp_degree(self.degree, len(controls))
-            knots = generate_clamped_knots(len(controls), degree)
+            for stroke in self.curves:
+                if len(stroke) < 2:
+                    continue
+                local_degree = clamp_degree(self.degree, len(stroke))
+                if len(stroke) < local_degree + 1:
+                    continue
+                export_curves.append(list(stroke))
+                export_degrees.append(local_degree)
+                export_knots.append(generate_clamped_knots(len(stroke), local_degree))
+
+        if not export_curves:
+            messagebox.showwarning("Export", "Chua co duong cong de xuat.")
+            return
+
+        controls = export_curves[0]
+        degree = export_degrees[0]
+        knots = export_knots[0]
 
         path = filedialog.asksaveasfilename(
             title="Export bsplinecurve.dat",
@@ -1272,19 +1369,25 @@ class BSplineApp:
             return
 
         try:
-            export_bsplinecurve_dat(path, controls, degree, knots)
-            if len(export_fits) > 1:
+            export_bsplinecurves_dat(
+                path,
+                export_curves,
+                export_degrees,
+                export_knots,
+                normalise_for_disco=True,
+            )
+            if len(export_curves) > 1:
                 base_path = Path(path)
-                for index, fit in enumerate(export_fits, start=1):
+                for index, (curve, curve_degree, curve_knots) in enumerate(zip(export_curves, export_degrees, export_knots), start=1):
                     part_path = base_path.with_name(f"{base_path.stem}_curve_{index:02d}{base_path.suffix}")
-                    export_bsplinecurve_dat(part_path, fit.control_points, fit.degree, fit.knots)
+                    export_bsplinecurve_dat(part_path, curve, curve_degree, curve_knots, normalise_for_disco=True)
             report_path = Path(path).with_suffix(".readable.txt")
             export_readable_report(report_path, controls, degree, knots)
         except Exception as exc:
             messagebox.showerror("Export", f"Khong xuat duoc file: {exc}")
             return
-        extra = f"\n\nDa xuat them {len(export_fits)} file curve rieng cung thu muc." if len(export_fits) > 1 else ""
-        messagebox.showinfo("Export", f"Da xuat:\n{path}\n\nBan doc de kiem tra:\n{report_path}{extra}")
+        extra = f"\n\nFile chinh da gom {len(export_curves)} BSPLINECURVE block. Dong thoi xuat them {len(export_curves)} file curve rieng cung thu muc." if len(export_curves) > 1 else ""
+        messagebox.showinfo("Export", f"Da xuat file dung format DISCO:\n{path}\n\nBan doc de kiem tra:\n{report_path}{extra}")
 
     def fit_view(self) -> None:
         points: list[Point2D] = []
